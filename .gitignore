@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+test_venv/
+.venv/
+
+# App data (user-specific)
+config.json
+logs/
+models/
+output/
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code local settings (contains machine-specific paths)
+.claude/
