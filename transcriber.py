@@ -928,6 +928,12 @@ def run_diarization(
 
     log.debug("Running diarization on audio_input (num_speakers=%s)...", num_speakers)
     diarization = pipeline(audio_input, **kwargs)
+    
+    # Support pyannote.audio 4.x+ where pipeline returns a DiarizeOutput object
+    # instead of an Annotation object directly.
+    if hasattr(diarization, "speaker_diarization"):
+        diarization = diarization.speaker_diarization
+
     segments = []
     for turn, _, speaker in diarization.itertracks(yield_label=True):
         segments.append({"start": turn.start, "end": turn.end, "speaker": speaker})
