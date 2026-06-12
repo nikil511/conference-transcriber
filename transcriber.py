@@ -816,8 +816,29 @@ def run_diarization(
     kwargs = {}
     if num_speakers and num_speakers > 0:
         kwargs["num_speakers"] = num_speakers
-    log.debug("Running diarization on %s (num_speakers=%s)...", audio_path, num_speakers)
-    diarization = pipeline(audio_path, **kwargs)
+    
+    # Pre-load audio into memory with soundfile to bypass buggy/missing torchcodec library on Windows
+    log.info("Pre-loading audio into memory with soundfile to bypass torchcodec...")
+    try:
+        import soundfile as sf
+        import torch
+        waveform_np, sample_rate = sf.read(audio_path, always_2d=False, dtype='float32')
+        waveform = torch.from_numpy(waveform_np).float()
+        if waveform.ndim == 1:
+            waveform = waveform[None, :]  # Shape: (1, time)
+        elif waveform.ndim == 2:
+            waveform = waveform.T  # Shape: (channels, time)
+        audio_input = {
+            "waveform": waveform,
+            "sample_rate": sample_rate
+        }
+        log.info("Audio loaded successfully into memory. Waveform shape: %s, Sample rate: %d", waveform.shape, sample_rate)
+    except Exception as e:
+        log.warning("Failed to pre-load audio with soundfile: %s. Falling back to file path.", e)
+        audio_input = audio_path
+
+    log.debug("Running diarization on audio_input (num_speakers=%s)...", num_speakers)
+    diarization = pipeline(audio_input, **kwargs)
     segments = []
     for turn, _, speaker in diarization.itertracks(yield_label=True):
         segments.append({"start": turn.start, "end": turn.end, "speaker": speaker})
