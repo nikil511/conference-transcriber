@@ -292,6 +292,27 @@ def _import_torch():
 
             torch.serialization._load = _safe_internal_load
 
+        # Strategy 4: Patch torch.inference_mode with torch.no_grad on Windows/DirectML
+        # to prevent "RuntimeError: Cannot set version_counter for inference tensor" on DirectML
+        try:
+            class inference_mode_mock:
+                def __init__(self, mode=True):
+                    self.mode = mode
+                    self.no_grad = torch.no_grad()
+                def __enter__(self):
+                    if self.mode:
+                        return self.no_grad.__enter__()
+                def __exit__(self, t, v, tb):
+                    if self.mode:
+                        return self.no_grad.__exit__(t, v, tb)
+                def __call__(self, func):
+                    return self.no_grad(func)
+            
+            torch.inference_mode = inference_mode_mock
+            log.info("Patched torch.inference_mode with torch.no_grad for DirectML compatibility")
+        except Exception as e:
+            log.debug("Could not patch torch.inference_mode: %s", e)
+
         _torch_patched = True
         log.debug("Patched torch.load to strip weights_only param")
     return torch
@@ -365,7 +386,7 @@ def _import_diarization():
                         pass
 
         if patched:
-            log.info("Patched use_auth_token→token compat on: %s", ", ".join(patched))
+            log.info("Patched use_auth_token->token compat on: %s", ", ".join(patched))
 
     from pyannote.audio import Pipeline
     return Pipeline
