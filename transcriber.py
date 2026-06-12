@@ -113,6 +113,7 @@ CONFIG_FILE = APP_DIR / "config.json"
 
 _whisper_model = None
 _whisper_model_size = None  # type: Optional[str]
+_whisper_backend = None  # "faster-whisper" or "openai-whisper"
 _diarization_pipeline = None
 
 # ---------------------------------------------------------------------------
@@ -461,10 +462,18 @@ def download_models(
     progress(0.0, desc="Downloading Whisper %s..." % model_size)
     ui_log("Downloading Whisper '%s' model..." % model_size)
     try:
+        # Pre-download for both possible backends (faster-whisper and openai-whisper)
+        import whisper
+        ui_log("  Downloading OpenAI Whisper model...")
+        _m_open = whisper.load_model(model_size, device="cpu")
+        del _m_open
+        
+        ui_log("  Downloading faster-whisper model...")
         WhisperModel = _import_whisper()
-        _m = WhisperModel(model_size, device="cpu", compute_type="int8")
-        del _m
-        ui_log("  OK - Whisper model downloaded and cached.")
+        _m_fast = WhisperModel(model_size, device="cpu", compute_type="int8")
+        del _m_fast
+        
+        ui_log("  OK - Whisper models downloaded and cached.")
     except Exception as e:
         ui_log("  FAILED - Whisper download failed: %s" % e)
         log.error("Whisper download traceback:\n%s", traceback.format_exc())
@@ -706,18 +715,52 @@ def download_models(
 # Model loaders
 # ---------------------------------------------------------------------------
 def get_whisper_model(model_size: str = "large-v3"):
-    global _whisper_model, _whisper_model_size
-    WhisperModel = _import_whisper()
+    global _whisper_model, _whisper_model_size, _whisper_backend
     if _whisper_model is None or _whisper_model_size != model_size:
         import torch
-        if torch.cuda.is_available():
+        
+        # Check if we should use DirectML + openai-whisper
+        use_dml = False
+        try:
+            import torch_directml
+            if torch_directml.is_available() and not torch.cuda.is_available():
+                use_dml = True
+        except ImportError:
+            pass
+
+        if use_dml:
+            log.info("Loading OpenAI Whisper '%s' on GPU (DirectML)...", model_size)
+            import whisper
+            import torch_directml
+            model = whisper.load_model(model_size, device="cpu")
+            
+            # Convert any sparse buffers to dense (e.g. alignment_heads) to prevent DirectML crash
+            for name, buf in list(model.named_buffers()):
+                if buf is not None and buf.is_sparse:
+                    log.debug("Converting sparse buffer '%s' to dense for DirectML compatibility", name)
+                    dense_buf = buf.to_dense()
+                    parts = name.split('.')
+                    submodule = model
+                    for part in parts[:-1]:
+                        submodule = getattr(submodule, part)
+                    submodule.register_buffer(parts[-1], dense_buf)
+                    
+            device = torch_directml.device()
+            _whisper_model = model.to(device)
+            _whisper_backend = "openai-whisper"
+        elif torch.cuda.is_available():
+            WhisperModel = _import_whisper()
             log.info("Loading Whisper '%s' on GPU (cuda, float16)...", model_size)
             _whisper_model = WhisperModel(model_size, device="cuda", compute_type="float16")
+            _whisper_backend = "faster-whisper"
         else:
+            WhisperModel = _import_whisper()
             log.info("Loading Whisper '%s' on CPU (int8)...", model_size)
             _whisper_model = WhisperModel(model_size, device="cpu", compute_type="int8")
+            _whisper_backend = "faster-whisper"
+            
         _whisper_model_size = model_size
-        log.info("Whisper model loaded.")
+        log.info("Whisper model loaded using %s backend.", _whisper_backend)
     return _whisper_model
 
 
@@ -797,8 +840,12 @@ def get_diarization_pipeline(hf_token: str):
             try:
                 import torch_directml
                 if torch_directml.is_available():
-                    device_str = "directml"
-                    device_obj = torch_directml.device()
+                    # Note: Pyannote uses an LSTM-heavy architecture (PyanNet) which crashes on DirectML
+                    # due to missing native LSTM operators (aten::_thnn_fused_lstm_cell).
+                    # Since diarization is lightweight, we fall back to CPU.
+                    log.info("DirectML detected. Falling back to CPU for Pyannote LSTM compatibility.")
+                    device_str = "cpu"
+                    device_obj = torch.device("cpu")
             except ImportError:
                 pass
                 
@@ -833,6 +880,27 @@ def run_diarization(
     hf_token: str,
     num_speakers: Optional[int] = None,
 ) -> List[Dict]:
+    import hashlib
+    # Generate cache key based on file name, size, and modification time
+    cache_file = None
+    try:
+        p = Path(audio_path)
+        stat = p.stat()
+        key_str = f"{p.name}_{stat.st_size}_{stat.st_mtime}_{num_speakers}"
+        cache_key = hashlib.md5(key_str.encode('utf-8')).hexdigest()
+        cache_dir = APP_DIR / "cache"
+        cache_dir.mkdir(exist_ok=True)
+        cache_file = cache_dir / f"{cache_key}_diarization.json"
+        
+        if cache_file.exists():
+            log.info("Found cached diarization results at %s. Loading...", cache_file)
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cached_segments = json.load(f)
+            log.info("Loaded %d segments from diarization cache.", len(cached_segments))
+            return cached_segments
+    except Exception as cache_err:
+        log.warning("Could not check/load diarization cache: %s", cache_err)
+
     pipeline = get_diarization_pipeline(hf_token)
     kwargs = {}
     if num_speakers and num_speakers > 0:
@@ -863,6 +931,15 @@ def run_diarization(
     segments = []
     for turn, _, speaker in diarization.itertracks(yield_label=True):
         segments.append({"start": turn.start, "end": turn.end, "speaker": speaker})
+
+    if cache_file:
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(segments, f, indent=4)
+            log.info("Saved diarization results to cache: %s", cache_file)
+        except Exception as cache_err:
+            log.warning("Could not save diarization cache: %s", cache_err)
+
     return segments
 
 
@@ -889,31 +966,70 @@ def run_transcription(
     progress_fn=None,
 ) -> Tuple[List[Dict], str]:
     model = get_whisper_model(model_size)
-    kw = {
-        "word_timestamps": True,
-        "vad_filter": True,
-        "vad_parameters": {"min_silence_duration_ms": 500},
-    }
-    if language and language != "auto":
-        kw["language"] = language
-    segments_gen, info = model.transcribe(audio_path, **kw)
-    audio_dur = info.duration if hasattr(info, "duration") and info.duration else 0
-    if audio_dur <= 0:
-        audio_dur = _get_audio_duration(audio_path)
-    log.info("Detected language: %s (%.0f%%), duration=%.1fs",
-             info.language, info.language_probability * 100, audio_dur)
-    segments = []
-    for seg in segments_gen:
-        segments.append({
-            "start": seg.start,
-            "end": seg.end,
-            "text": seg.text.strip(),
-        })
-        # Report per-segment progress
+    
+    audio_dur = _get_audio_duration(audio_path)
+    
+    if _whisper_backend == "openai-whisper":
+        kw = {
+            "word_timestamps": True,
+            "fp16": False,  # Crucial: DirectML doesn't support fp16 well for Whisper
+        }
+        if language and language != "auto":
+            kw["language"] = language
+            
+        log.info("Starting Whisper transcription on GPU (DirectML)...")
         if progress_fn and audio_dur > 0:
-            pct = min(seg.end / audio_dur, 1.0)
-            progress_fn(pct, seg.end, audio_dur)
-    return segments, info.language
+            progress_fn(0.1, 0, audio_dur)
+            
+        result = model.transcribe(audio_path, **kw)
+        
+        detected_lang = result.get("language", "en")
+        log.info("Detected language: %s", detected_lang)
+        
+        segments = []
+        raw_segs = result.get("segments", [])
+        for seg in raw_segs:
+            segments.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg["text"].strip(),
+            })
+            
+        if progress_fn and audio_dur > 0:
+            progress_fn(1.0, audio_dur, audio_dur)
+            
+        return segments, detected_lang
+        
+    else:
+        kw = {
+            "word_timestamps": True,
+            "vad_filter": True,
+            "vad_parameters": {"min_silence_duration_ms": 500},
+        }
+        if language and language != "auto":
+            kw["language"] = language
+            
+        segments_gen, info = model.transcribe(audio_path, **kw)
+        info_dur = info.duration if hasattr(info, "duration") and info.duration else 0
+        if info_dur > 0:
+            audio_dur = info_dur
+            
+        log.info("Detected language: %s (%.0f%%), duration=%.1fs",
+                 info.language, info.language_probability * 100, audio_dur)
+                 
+        segments = []
+        for seg in segments_gen:
+            segments.append({
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text.strip(),
+            })
+            # Report per-segment progress
+            if progress_fn and audio_dur > 0:
+                pct = min(seg.end / audio_dur, 1.0)
+                progress_fn(pct, seg.end, audio_dur)
+                
+        return segments, info.language
 
 
 # ---------------------------------------------------------------------------
@@ -1066,44 +1182,76 @@ def transcribe_video(
         live_lines = []
         try:
             model = get_whisper_model(model_size)
-            kw = {
-                "word_timestamps": True,
-                "vad_filter": True,
-                "vad_parameters": {"min_silence_duration_ms": 500},
-            }
-            lang_arg = language if language != "auto" else None
-            if lang_arg:
-                kw["language"] = lang_arg
-            segments_gen, info = model.transcribe(audio_path, **kw)
-            t_audio_dur = info.duration if hasattr(info, "duration") and info.duration else audio_dur
-            if t_audio_dur <= 0:
-                t_audio_dur = audio_dur
-            log.info("Detected language: %s (%.0f%%)",
-                     info.language, info.language_probability * 100)
-            detected_lang = info.language
+            if _whisper_backend == "openai-whisper":
+                kw = {
+                    "word_timestamps": True,
+                    "fp16": False,  # Crucial: DirectML doesn't support fp16 well for Whisper
+                }
+                if language and language != "auto":
+                    kw["language"] = language
 
-            trans_segs = []
-            for seg in segments_gen:
-                trans_segs.append({
-                    "start": seg.start,
-                    "end": seg.end,
-                    "text": seg.text.strip(),
-                })
-                # Format timestamp for display
-                ts = "%d:%02d" % (int(seg.start) // 60, int(seg.start) % 60)
-                live_lines.append("[%s] %s" % (ts, seg.text.strip()))
-                # Update progress bar
-                if t_audio_dur > 0:
-                    pct = min(seg.end / t_audio_dur, 1.0)
-                    pos_str = "%d:%02d" % (int(seg.end) // 60, int(seg.end) % 60)
-                    tot_str = "%d:%02d" % (int(t_audio_dur) // 60, int(t_audio_dur) % 60)
-                    overall = 0.40 + pct * 0.45
-                    progress(overall,
-                             desc="Step 3/4 — Transcribing %s / %s (%d%%)"
-                             % (pos_str, tot_str, int(pct * 100)))
-                # Yield live text (show last 50 lines to keep it scrollable)
+                log.info("Starting Whisper transcription on GPU (DirectML)...")
+                progress(0.40, desc="Step 3/4 — Transcribing with Whisper (DirectML GPU)...")
+                
+                result = model.transcribe(audio_path, **kw)
+                
+                detected_lang = result.get("language", "en")
+                log.info("Detected language: %s", detected_lang)
+                
+                trans_segs = []
+                raw_segs = result.get("segments", [])
+                for seg in raw_segs:
+                    trans_segs.append({
+                        "start": seg["start"],
+                        "end": seg["end"],
+                        "text": seg["text"].strip(),
+                    })
+                    ts = "%d:%02d" % (int(seg["start"]) // 60, int(seg["start"]) % 60)
+                    live_lines.append("[%s] %s" % (ts, seg["text"].strip()))
+
+                progress(0.85, desc="Step 3/4 — Transcription completed.")
                 live_display = "\n".join(live_lines[-50:])
                 yield status_3, live_display, "", None
+                
+            else:
+                kw = {
+                    "word_timestamps": True,
+                    "vad_filter": True,
+                    "vad_parameters": {"min_silence_duration_ms": 500},
+                }
+                lang_arg = language if language != "auto" else None
+                if lang_arg:
+                    kw["language"] = lang_arg
+                segments_gen, info = model.transcribe(audio_path, **kw)
+                t_audio_dur = info.duration if hasattr(info, "duration") and info.duration else audio_dur
+                if t_audio_dur <= 0:
+                    t_audio_dur = audio_dur
+                log.info("Detected language: %s (%.0f%%)",
+                         info.language, info.language_probability * 100)
+                detected_lang = info.language
+
+                trans_segs = []
+                for seg in segments_gen:
+                    trans_segs.append({
+                        "start": seg.start,
+                        "end": seg.end,
+                        "text": seg.text.strip(),
+                    })
+                    # Format timestamp for display
+                    ts = "%d:%02d" % (int(seg.start) // 60, int(seg.start) % 60)
+                    live_lines.append("[%s] %s" % (ts, seg.text.strip()))
+                    # Update progress bar
+                    if t_audio_dur > 0:
+                        pct = min(seg.end / t_audio_dur, 1.0)
+                        pos_str = "%d:%02d" % (int(seg.end) // 60, int(seg.end) % 60)
+                        tot_str = "%d:%02d" % (int(t_audio_dur) // 60, int(t_audio_dur) % 60)
+                        overall = 0.40 + pct * 0.45
+                        progress(overall,
+                                 desc="Step 3/4 — Transcribing %s / %s (%d%%)"
+                                 % (pos_str, tot_str, int(pct * 100)))
+                    # Yield live text (show last 50 lines to keep it scrollable)
+                    live_display = "\n".join(live_lines[-50:])
+                    yield status_3, live_display, "", None
 
             elapsed = _time.time() - t0
             log.info("  Transcribed %d segments, language: %s (%.0fs elapsed)",
