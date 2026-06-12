@@ -215,9 +215,28 @@ def _check_ffmpeg() -> str:
         r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
         return r.stdout.split("\n")[0] if r.stdout else "found"
     except FileNotFoundError:
-        raise RuntimeError(
-            "ffmpeg is not installed.\nInstall it with:  brew install ffmpeg"
-        )
+        pass
+
+    # Try to locate Gyan.FFmpeg from winget directory and append to PATH
+    import glob
+    user_profile = os.environ.get("USERPROFILE", "")
+    if user_profile:
+        winget_dir = os.path.join(user_profile, "AppData", "Local", "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe")
+        if os.path.isdir(winget_dir):
+            ffmpeg_subdirs = glob.glob(os.path.join(winget_dir, "ffmpeg-*"))
+            for d in ffmpeg_subdirs:
+                bin_dir = os.path.join(d, "bin")
+                if os.path.isfile(os.path.join(bin_dir, "ffmpeg.exe")):
+                    os.environ["PATH"] = os.environ["PATH"] + os.path.pathsep + bin_dir
+                    try:
+                        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+                        return r.stdout.split("\n")[0] if r.stdout else "found"
+                    except FileNotFoundError:
+                        pass
+
+    raise RuntimeError(
+        "ffmpeg is not installed.\nInstall it with:  brew install ffmpeg"
+    )
 
 
 _torch_patched = False
@@ -669,8 +688,13 @@ def get_whisper_model(model_size: str = "large-v3"):
     global _whisper_model, _whisper_model_size
     WhisperModel = _import_whisper()
     if _whisper_model is None or _whisper_model_size != model_size:
-        log.info("Loading Whisper '%s' on cpu (int8)...", model_size)
-        _whisper_model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        import torch
+        if torch.cuda.is_available():
+            log.info("Loading Whisper '%s' on GPU (cuda, float16)...", model_size)
+            _whisper_model = WhisperModel(model_size, device="cuda", compute_type="float16")
+        else:
+            log.info("Loading Whisper '%s' on CPU (int8)...", model_size)
+            _whisper_model = WhisperModel(model_size, device="cpu", compute_type="int8")
         _whisper_model_size = model_size
         log.info("Whisper model loaded.")
     return _whisper_model
@@ -738,10 +762,28 @@ def get_diarization_pipeline(hf_token: str):
                 "     create a new one at https://huggingface.co/settings/tokens"
             )
 
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-        log.info("Diarization device: %s", device)
-        if device == "mps":
-            pipeline.to(torch.device("mps"))
+        # Determine the best available PyTorch device (CUDA -> MPS -> DirectML -> CPU)
+        device_str = "cpu"
+        device_obj = torch.device("cpu")
+        
+        if torch.cuda.is_available():
+            device_str = "cuda"
+            device_obj = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device_str = "mps"
+            device_obj = torch.device("mps")
+        else:
+            try:
+                import torch_directml
+                if torch_directml.is_available():
+                    device_str = "directml"
+                    device_obj = torch_directml.device()
+            except ImportError:
+                pass
+                
+        log.info("Diarization device: %s", device_str)
+        if device_str != "cpu":
+            pipeline.to(device_obj)
         _diarization_pipeline = pipeline
     return _diarization_pipeline
 
@@ -902,10 +944,10 @@ def transcribe_video(
         yield "No video file provided.", "", "", None
         return
     if not hf_token or not hf_token.strip().startswith("hf_"):
-        yield "Please provide a valid HuggingFace token (starts with hf_).", "", "", None
-        return
+        hf_token = ""
+    else:
+        hf_token = hf_token.strip()
 
-    hf_token = hf_token.strip()
     num_speakers = int(num_speakers)
     video_name = Path(video_path).stem
 
@@ -942,26 +984,32 @@ def transcribe_video(
             return
 
         # ── Step 2/4: Speaker diarization ────────────────────────────
-        progress(0.08, desc="Step 2/4 — Identifying speakers...")
-        yield ("Step 2/4 — Identifying speakers...\n"
-               "  Video: %s (%s)\n"
-               "  This usually takes 1-3 minutes on CPU."
-               % (Path(video_path).name, dur_str)), "", "", None
-        log.info("Step 2/4: Running speaker diarization...")
-        try:
-            diar_segs = run_diarization(
-                audio_path, hf_token,
-                num_speakers=num_speakers if num_speakers > 0 else None,
-            )
-            n_speakers = len(set(s["speaker"] for s in diar_segs))
-            elapsed = _time.time() - t0
-            log.info("  Found %d segments, %d speakers (%.0fs elapsed)",
-                     len(diar_segs), n_speakers, elapsed)
-            progress(0.35, desc="Step 2/4 — Found %d speakers" % n_speakers)
-        except Exception as e:
-            log.error("Speaker diarization failed:\n%s", traceback.format_exc())
-            yield "Speaker diarization failed:\n%s" % e, "", "", None
-            return
+        if hf_token:
+            progress(0.08, desc="Step 2/4 — Identifying speakers...")
+            yield ("Step 2/4 — Identifying speakers...\n"
+                   "  Video: %s (%s)\n"
+                   "  This usually takes 1-3 minutes on CPU."
+                   % (Path(video_path).name, dur_str)), "", "", None
+            log.info("Step 2/4: Running speaker diarization...")
+            try:
+                diar_segs = run_diarization(
+                    audio_path, hf_token,
+                    num_speakers=num_speakers if num_speakers > 0 else None,
+                )
+                n_speakers = len(set(s["speaker"] for s in diar_segs))
+                elapsed = _time.time() - t0
+                log.info("  Found %d segments, %d speakers (%.0fs elapsed)",
+                         len(diar_segs), n_speakers, elapsed)
+                progress(0.35, desc="Step 2/4 — Found %d speakers" % n_speakers)
+            except Exception as e:
+                log.error("Speaker diarization failed:\n%s", traceback.format_exc())
+                yield "Speaker diarization failed:\n%s" % e, "", "", None
+                return
+        else:
+            diar_segs = []
+            n_speakers = 0
+            log.info("Step 2/4: Skipping speaker diarization (no HuggingFace token provided).")
+            progress(0.35, desc="Step 2/4 — Skipping speaker diarization (no HuggingFace token)")
 
         # ── Step 3/4: Transcription with live text ───────────────────
         progress(0.38, desc="Step 3/4 — Loading Whisper %s..." % model_size)
@@ -1239,5 +1287,77 @@ def build_ui():
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    app = build_ui()
-    app.launch(server_name="127.0.0.1", server_port=7860, share=False, inbrowser=True)
+    import argparse
+
+    # We run in CLI mode if CLI arguments are provided
+    if len(sys.argv) > 1 and sys.argv[1] not in ("--gui", "gui"):
+        parser = argparse.ArgumentParser(
+            description="Conference Video Transcriber (CLI Mode)"
+        )
+        parser.add_argument("-v", "--video", type=str, required=True, help="Path to video file")
+        parser.add_argument("-t", "--token", type=str, default="", help="HuggingFace Token (starts with hf_). If omitted, loads from config.json")
+        parser.add_argument("-m", "--model", type=str, default="medium", choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"], help="Whisper model size")
+        parser.add_argument("-l", "--language", type=str, default="auto", help="Language (e.g. en, el, de, auto)")
+        parser.add_argument("-s", "--speakers", type=int, default=0, help="Number of speakers (0 = auto-detect)")
+        parser.add_argument("-o", "--output-dir", type=str, default="", help="Output directory for SRT file")
+        parser.add_argument("--setup", action="store_true", help="Pre-download and cache models before transcribing")
+
+        args = parser.parse_args()
+
+        # 1. Resolve token
+        hf_token = args.token.strip() if args.token else load_config().get("hf_token", "")
+        if not hf_token or not hf_token.startswith("hf_"):
+            print("WARNING: No valid HuggingFace token provided. Speaker diarization will be skipped.")
+            print("To enable speaker diarization, specify a token with -t/--token or run the GUI setup once.")
+            hf_token = ""
+
+        # 2. Check setup
+        if args.setup:
+            print(f"Checking/Downloading models (Model: {args.model})...")
+            class SetupProgress:
+                def __call__(self, value, desc=""):
+                    print(f"[{int(value*100)}%] {desc}", flush=True)
+            log_res = download_models(hf_token, args.model, progress=SetupProgress())
+            print(log_res)
+            print("-" * 50)
+
+        # 3. Perform transcription
+        print(f"Initializing transcription pipeline for: {args.video}")
+        class CLIProgress:
+            def __call__(self, value, desc=""):
+                percent = int(value * 100) if value is not None else 0
+                print(f"[PROGRESS] {percent}%: {desc}", flush=True)
+
+        try:
+            # Consume the generator to completion
+            final_step = None
+            for step in transcribe_video(
+                video_path=args.video,
+                hf_token=hf_token,
+                model_size=args.model,
+                language=args.language,
+                num_speakers=args.speakers,
+                output_dir=args.output_dir,
+                progress=CLIProgress(),
+            ):
+                final_step = step
+
+            if final_step:
+                summary, final_lines, srt_content, srt_path = final_step
+                print("\n" + "=" * 60)
+                print(summary)
+                print("=" * 60)
+                print(f"SUCCESS: SRT file saved to {srt_path}")
+            else:
+                print("ERROR: Transcription pipeline produced no results.")
+                sys.exit(1)
+        except Exception as err:
+            print(f"\nERROR running transcription: {err}")
+            traceback.print_exc()
+            sys.exit(1)
+
+    else:
+        # Default Gradio GUI mode
+        app = build_ui()
+        app.launch(server_name="127.0.0.1", server_port=7860, share=False, inbrowser=True)
+
