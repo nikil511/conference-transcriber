@@ -732,6 +732,7 @@ def get_whisper_model(model_size: str = "large-v3"):
             log.info("Loading OpenAI Whisper '%s' on GPU (DirectML)...", model_size)
             import whisper
             import torch_directml
+            
             model = whisper.load_model(model_size, device="cpu")
             
             # Convert any sparse buffers to dense (e.g. alignment_heads) to prevent DirectML crash
@@ -747,6 +748,25 @@ def get_whisper_model(model_size: str = "large-v3"):
                     
             device = torch_directml.device()
             _whisper_model = model.to(device)
+            
+            # DirectML compatibility patches
+            if hasattr(_whisper_model, "alignment_heads"):
+                log.info("Restoring alignment_heads to CPU sparse layout for DirectML timing compatibility")
+                _whisper_model.alignment_heads = _whisper_model.alignment_heads.to("cpu").to_sparse()
+                
+            try:
+                import whisper.timing
+                orig_median_filter = whisper.timing.median_filter
+                def patched_median_filter(x, filter_width):
+                    orig_device = x.device
+                    x_cpu = x.to("cpu")
+                    res_cpu = orig_median_filter(x_cpu, filter_width)
+                    return res_cpu.to(orig_device)
+                whisper.timing.median_filter = patched_median_filter
+                log.info("Patched whisper.timing.median_filter to CPU to bypass DirectML reflect pad bug")
+            except Exception as patch_err:
+                log.warning("Could not patch whisper.timing.median_filter: %s", patch_err)
+                
             _whisper_backend = "openai-whisper"
         elif torch.cuda.is_available():
             WhisperModel = _import_whisper()
@@ -879,14 +899,15 @@ def run_diarization(
     audio_path: str,
     hf_token: str,
     num_speakers: Optional[int] = None,
+    video_path: Optional[str] = None,
 ) -> List[Dict]:
     import hashlib
-    # Generate cache key based on file name, size, and modification time
+    # Generate cache key based on video path if available, else audio path
     cache_file = None
     try:
-        p = Path(audio_path)
-        stat = p.stat()
-        key_str = f"{p.name}_{stat.st_size}_{stat.st_mtime}_{num_speakers}"
+        ref_path = Path(video_path) if video_path else Path(audio_path)
+        stat = ref_path.stat()
+        key_str = f"{ref_path.name}_{stat.st_size}_{stat.st_mtime}_{num_speakers}"
         cache_key = hashlib.md5(key_str.encode('utf-8')).hexdigest()
         cache_dir = APP_DIR / "cache"
         cache_dir.mkdir(exist_ok=True)
@@ -1159,6 +1180,7 @@ def transcribe_video(
                 diar_segs = run_diarization(
                     audio_path, hf_token,
                     num_speakers=num_speakers if num_speakers > 0 else None,
+                    video_path=video_path,
                 )
                 n_speakers = len(set(s["speaker"] for s in diar_segs))
                 elapsed = _time.time() - t0
@@ -1190,7 +1212,7 @@ def transcribe_video(
             model = get_whisper_model(model_size)
             if _whisper_backend == "openai-whisper":
                 kw = {
-                    "word_timestamps": True,
+                    "word_timestamps": False,
                     "fp16": False,  # Crucial: DirectML doesn't support fp16 well for Whisper
                 }
                 if language and language != "auto":
