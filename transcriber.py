@@ -723,7 +723,7 @@ def get_whisper_model(model_size: str = "large-v3"):
         use_dml = False
         try:
             import torch_directml
-            if torch_directml.is_available() and not torch.cuda.is_available():
+            if torch_directml.is_available() and not torch.cuda.is_available() and os.environ.get("FORCE_CPU") != "1":
                 use_dml = True
         except ImportError:
             pass
