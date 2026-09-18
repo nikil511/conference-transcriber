@@ -244,6 +244,7 @@ _torch_patched = False
 
 def _import_torch():
     global _torch_patched
+    os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
     import torch
     if not _torch_patched:
         # PyTorch 2.6+ defaults torch.load to weights_only=True, which breaks
@@ -1107,6 +1108,14 @@ def generate_srt(merged_segments: List[Dict]) -> str:
     return "\n".join(blocks)
 
 
+from merge_transcript import (
+    merge_speaker_turns,
+    generate_merged_srt,
+    generate_transcript_text,
+    generate_transcript_markdown,
+)
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -1289,48 +1298,69 @@ def transcribe_video(
             yield "Transcription failed:\n%s" % e, "\n".join(live_lines) if live_lines else "", "", None
             return
 
-    # ── Step 4/4: Merge + generate SRT ───────────────────────────
+    # ── Step 4/4: Merge + generate SRT & Transcripts ─────────────
     progress(0.87, desc="Step 4/4 — Assigning speakers to segments...")
     yield "Step 4/4 — Assigning speakers to text...", "\n".join(live_lines[-50:]), "", None
     log.info("Step 4/4: Merging speakers + transcription...")
     merged = assign_speakers(trans_segs, diar_segs)
 
-    progress(0.92, desc="Step 4/4 — Writing SRT file...")
-    srt_content = generate_srt(merged)
+    progress(0.92, desc="Step 4/4 — Connecting speaker sentences...")
+    turns = merge_speaker_turns(merged)
 
+    # 1. Standard segment-by-segment SRT
+    srt_content = generate_srt(merged)
     srt_path = os.path.join(save_dir, "%s_transcribed.srt" % video_name)
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write(srt_content)
+
+    # 2. Merged speaker turns SRT (connected full sentences)
+    merged_srt_content = generate_merged_srt(turns)
+    merged_srt_path = os.path.join(save_dir, "%s_merged.srt" % video_name)
+    with open(merged_srt_path, "w", encoding="utf-8") as f:
+        f.write(merged_srt_content)
+
+    # 3. Clean Markdown transcript
+    transcript_md = generate_transcript_markdown(turns, title=video_name)
+    transcript_path = os.path.join(save_dir, "%s_transcript.md" % video_name)
+    with open(transcript_path, "w", encoding="utf-8") as f:
+        f.write(transcript_md)
+
+    # 4. Clean plain text transcript
+    transcript_txt = generate_transcript_text(turns, title=video_name)
+    txt_path = os.path.join(save_dir, "%s_transcript.txt" % video_name)
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(transcript_txt)
 
     total_elapsed = _time.time() - t0
     elapsed_str = "%d:%02d" % (int(total_elapsed) // 60, int(total_elapsed) % 60)
     speakers = sorted(set(s["speaker"] for s in merged))
     speaker_list = ", ".join(s.replace("SPEAKER_", "Speaker ") for s in speakers)
 
-    # Build a nice live view with speaker labels from the final SRT
+    # Build clean readable view with speaker labels and timestamps
     final_lines = []
-    for seg in merged:
-        ts = "%d:%02d" % (int(seg["start"]) // 60, int(seg["start"] ) % 60)
-        spk = seg["speaker"].replace("SPEAKER_", "Speaker ")
-        final_lines.append("[%s] [%s] %s" % (ts, spk, seg["text"]))
+    for t in turns:
+        final_lines.append("[%s] [%s]: %s" % (t["start_clock"], t["speaker"], t["text"]))
 
     summary = (
         "Transcription complete!\n\n"
-        "  Video:    %s\n"
-        "  Duration: %s\n"
-        "  Language: %s\n"
-        "  Speakers: %d (%s)\n"
-        "  Segments: %d\n"
-        "  Time:     %s\n"
-        "  SRT saved: %s\n"
+        "  Video:        %s\n"
+        "  Duration:     %s\n"
+        "  Language:     %s\n"
+        "  Speakers:     %d (%s)\n"
+        "  Segments:     %d (connected into %d speaker turns)\n"
+        "  Time:         %s\n"
+        "  Merged SRT:   %s\n"
+        "  Transcript:   %s\n"
+        "  Standard SRT: %s\n"
         % (Path(video_path).name, dur_str, detected_lang,
-           len(speakers), speaker_list, len(merged), elapsed_str, srt_path)
+           len(speakers), speaker_list, len(merged), len(turns), elapsed_str,
+           merged_srt_path, transcript_path, srt_path)
     )
 
-    log.info("Done! %d speakers, %d segments, %s elapsed → %s",
-             len(speakers), len(merged), elapsed_str, srt_path)
-    progress(1.0, desc="Done! %d speakers, %d segments (%s)" % (len(speakers), len(merged), elapsed_str))
-    yield summary, "\n".join(final_lines), srt_content, srt_path
+    log.info("Done! %d speakers, %d segments (%d turns), %s elapsed → %s",
+             len(speakers), len(merged), len(turns), elapsed_str, merged_srt_path)
+    progress(1.0, desc="Done! %d speakers, %d turns (%s)" % (len(speakers), len(turns), elapsed_str))
+    yield summary, "\n\n".join(final_lines), merged_srt_content, merged_srt_path
 
 
 # ---------------------------------------------------------------------------
@@ -1353,9 +1383,12 @@ def transcribe_batch(
         path = file_obj if isinstance(file_obj, str) else str(file_obj)
         name = Path(path).name
         progress(i / len(files), desc="%s (%d/%d)..." % (name, i + 1, len(files)))
-        summary, _, _ = transcribe_video(
+        last_step = None
+        for step in transcribe_video(
             path, hf_token, model_size, language, num_speakers, output_dir, progress,
-        )
+        ):
+            last_step = step
+        summary = last_step[0] if last_step else "No output"
         results.append("--- %s ---\n%s" % (name, summary))
     return "\n\n".join(results)
 
